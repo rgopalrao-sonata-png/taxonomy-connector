@@ -12,8 +12,11 @@ Change Log
 .. There should always be an "Unreleased" section for changes pending release.
 
 Unreleased
+
+[2.3.22] - 2026-03-25
 ----------
-Nothing
+* fix: Modernize choice field naming in ``taxonomy.choices`` to follow Django conventions (UPPER_SNAKE_CASE)
+* See https://github.com/openedx/taxonomy-connector/pull/291/changes/BASE..fc7b11c3f0666204abd4c4d35296978f716ed338#r2987507262 for details.
 
 [2.3.21]
 ---------------------
