@@ -2,16 +2,22 @@
 """
 Tests for Algolia translation utilities.
 """
+import logging
+from unittest.mock import MagicMock
+
 import pytest
 
+import taxonomy.algolia.utils as algolia_utils
 from taxonomy.algolia.utils import (
     build_name_translation_maps,
     create_localized_job_records,
+    fetch_jobs_data,
+    index_jobs_data_in_algolia,
     translate_industries_array,
     translate_job_record,
     translate_skill_dict,
 )
-from taxonomy.models import Industry, Job, Skill, TaxonomyTranslation
+from taxonomy.models import Industry, IndustryJobSkill, Job, JobSkills, Skill, TaxonomyTranslation
 
 
 @pytest.mark.django_db
@@ -419,3 +425,95 @@ class TestCreateLocalizedJobRecords:
         result = create_localized_job_records([], 'es')
 
         assert result == []
+
+    def test_logs_progress_every_thousand_records(self, caplog, monkeypatch):
+        """Test progress log branch is hit when processing every 1000th record."""
+        english_jobs = [
+            {
+                'objectID': f'job-{idx}',
+                'id': idx,
+                'external_id': f'ET{idx}',
+                'name': 'Engineer',
+                'description': '',
+                'skills': [],
+                'job_postings': [],
+                'industry_names': [],
+                'industries': [],
+                'similar_jobs': [],
+                'b2c_opt_in': False,
+                'job_sources': [],
+            }
+            for idx in range(1, 1001)
+        ]
+
+        monkeypatch.setattr(
+            algolia_utils,
+            'translate_job_record',
+            lambda english_job, *_: {
+                **english_job,
+                'metadata_language': 'es',
+            }
+        )
+
+        caplog.set_level(logging.INFO)
+        result = create_localized_job_records(english_jobs, 'es')
+
+        assert len(result) == 1000
+        assert any('Translated 1000/1000 jobs to es' in record.message for record in caplog.records)
+
+
+@pytest.mark.django_db
+class TestIndexJobsDataInAlgolia:
+    """Tests for full index build flow with localized records."""
+
+    def test_indexes_english_and_localized_jobs(self, monkeypatch):
+        """Test indexing appends localized records for each configured language."""
+        client = MagicMock()
+        monkeypatch.setattr(algolia_utils, 'AlgoliaClient', MagicMock(return_value=client))
+
+        english_jobs = [{'objectID': 'job-ET1', 'name': 'Engineer', 'metadata_language': 'en'}]
+        monkeypatch.setattr(algolia_utils, 'fetch_jobs_data', lambda: list(english_jobs))
+        monkeypatch.setattr(algolia_utils, 'TAXONOMY_TRANSLATION_LOCALES', ['es', 'fr'])
+
+        def _create_localized(jobs_data, language_code):
+            return [{'objectID': f'job-ET1-{language_code}', 'name': 'Engineer', 'metadata_language': language_code}]
+
+        monkeypatch.setattr(algolia_utils, 'create_localized_job_records', _create_localized)
+
+        index_jobs_data_in_algolia()
+
+        client.set_index_settings.assert_called_once()
+        indexed_objects = client.replace_all_objects.call_args[0][0]
+        assert len(indexed_objects) == 3
+        assert {obj['metadata_language'] for obj in indexed_objects} == {'en', 'es', 'fr'}
+
+
+@pytest.mark.django_db
+class TestFetchJobsData:
+    """Tests for english jobs serialization payload."""
+
+    def test_adds_metadata_language_to_serialized_jobs(self, monkeypatch):
+        """Test serialized jobs include metadata_language='en'."""
+        Job.objects.create(external_id='ET1', name='Engineer')
+
+        monkeypatch.setattr(algolia_utils, 'fetch_and_combine_job_details', lambda _qs: {})
+        monkeypatch.setattr(algolia_utils, 'combine_industry_skills', lambda: {})
+        monkeypatch.setattr(algolia_utils, 'get_job_ids', lambda _qs: set())
+        monkeypatch.setattr(JobSkills, 'get_whitelisted_job_skill_qs', classmethod(lambda cls: JobSkills.objects.none()))
+        monkeypatch.setattr(
+            IndustryJobSkill,
+            'get_whitelisted_job_skill_qs',
+            classmethod(lambda cls: IndustryJobSkill.objects.none())
+        )
+
+        class DummySerializer:
+            """Serializer stub for deterministic test payload."""
+
+            def __init__(self, *args, **kwargs):
+                self.data = [{'objectID': 'job-ET1', 'name': 'Engineer'}]
+
+        monkeypatch.setattr(algolia_utils, 'JobSerializer', DummySerializer)
+
+        jobs = fetch_jobs_data()
+
+        assert jobs == [{'objectID': 'job-ET1', 'name': 'Engineer', 'metadata_language': 'en'}]
